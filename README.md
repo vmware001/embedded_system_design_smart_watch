@@ -217,7 +217,42 @@ python ble_control.py SYNC,14:30:00  # 同步时间
 
 #### 手机 APP 截图
 
-> 实时日志显示 `STEPS:55 TEMP:20`，数据后附 `\x00` 填充（HC-05 缓冲 workaround）。
+> 实时日志显示 `STEPS:55 TEMP:20`，数据后附 `\x00` 填充。
+
+#### 为什么每次要填充到 230 字节？
+
+**现象**：最初调试时，STM32 明明调用了 `HAL_UART_Transmit()` 发送数据，但手机端要么收不到，要么等 10 秒以上才收到一次，极不稳定。
+
+**根因**：我们使用的 HC-05（实际是某廉价 BLE 透传模块）固件版本为 **v3.0/v4.0**，该版本存在已知的 **230 字节缓冲 Bug**：模块内部维护一个 230 字节的 FIFO 缓冲区，**数据不满 230 字节不会立即通过 BLE 发出去**，而是等缓冲区填满或超时（约 10~15 秒）才批量发送。
+
+| 发送内容 | 实际长度 | 模块行为 | 手机接收 |
+|---------|---------|---------|---------|
+| `STEPS:55 TEMP:20\r\n` | 18 字节 | 缓冲中，等待填满 | 无（或 10s+ 延迟） |
+| 填充至 230 字节 | 230 字节 | 立即触发发送 | 实时收到 |
+
+**Workaround**：每次发送时，将有效数据拷贝到 230 字节的缓冲区，剩余部分用 `\0`（NULL）填充，然后一次性发送 230 字节。BLE 模块收到后立即发送，手机端收到后按 C 字符串规则自然忽略尾部 `\0`。
+
+```c
+void Bluetooth_SendString(const char *str) {
+    // HC-05 v3.0/v4.0 firmware bug: buffers up to 230 bytes before sending
+    // Workaround: pad every transmission to 230 bytes with nulls
+    uint8_t buf[230];
+    uint16_t len = strlen(str);
+    
+    if (len > 230) len = 230;
+    memcpy(buf, str, len);
+    // Pad with zeros to 230 bytes (module ignores trailing nulls)
+    for (uint16_t i = len; i < 230; i++) {
+        buf[i] = 0x00;
+    }
+    HAL_UART_Transmit(bt_uart, buf, 230, 500);
+}
+```
+
+**代价与权衡**：
+- **吞吐量**：每次有效负载仅 ~20 字节，却要发送 230 字节，物理层效率仅 **~9%**
+- **实时性**：换来了每 2 秒稳定推送一次，否则延迟不可接受
+- **替代方案**：更换无此 bug 的模块（如 JDY-31、HC-04 v2.0），但受限于课程提供的硬件未替换
 
 ---
 
